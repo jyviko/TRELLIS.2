@@ -77,7 +77,7 @@ if [ "$NEW_ENV" = true ] ; then
 fi
 
 if [ "$BASIC" = true ] ; then
-    pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers gradio==6.0.1 tensorboard pandas lpips zstandard
+    pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers gradio==6.0.1 tensorboard pandas lpips zstandard psutil
     pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
     sudo apt install -y libjpeg-dev
     pip install pillow-simd
@@ -86,7 +86,7 @@ fi
 
 if [ "$FLASHATTN" = true ] ; then
     if [ "$PLATFORM" = "cuda" ] ; then
-        pip install flash-attn==2.7.3
+        pip install flash-attn==2.7.3 --no-build-isolation
     elif [ "$PLATFORM" = "hip" ] ; then
         echo "[FLASHATTN] Prebuilt binaries not found. Building from source..."
         mkdir -p /tmp/extensions
@@ -134,6 +134,15 @@ fi
 
 if [ "$OVOXEL" = true ] ; then
     mkdir -p /tmp/extensions
+    if command -v apt-get > /dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y libeigen3-dev
+    else
+        echo "[OVOXEL] apt-get not found; please install Eigen (libeigen3-dev) manually."
+    fi
+    export CPLUS_INCLUDE_PATH=/usr/include/eigen3:$CPLUS_INCLUDE_PATH
+    cd $WORKDIR
+    git submodule update --init --recursive
     cp -r o-voxel /tmp/extensions/o-voxel
     pip install /tmp/extensions/o-voxel --no-build-isolation
 fi
