@@ -379,6 +379,7 @@ def image_to_3d(
     extra_view_8: Optional[Image.Image],
     seed: int,
     resolution: str,
+    multi_image_mode: str,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
     ss_sampling_steps: int,
@@ -407,6 +408,7 @@ def image_to_3d(
         image_input,
         seed=seed,
         preprocess_image=False,
+        multi_image_mode=multi_image_mode,
         sparse_structure_sampler_params={
             "steps": ss_sampling_steps,
             "guidance_strength": ss_guidance_strength,
@@ -577,6 +579,11 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
+            multi_image_mode = gr.Radio(
+                ["stochastic", "multidiffusion"],
+                label="Multi-Image Mode",
+                value="stochastic",
+            )
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
             
@@ -658,7 +665,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     ).then(
         image_to_3d,
         inputs=[
-            image_prompt, *extra_views, seed, resolution,
+            image_prompt, *extra_views, seed, resolution, multi_image_mode,
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
             tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
