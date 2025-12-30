@@ -1,4 +1,6 @@
 from typing import *
+from contextlib import contextmanager
+from types import MethodType
 import torch
 import torch.nn as nn
 import numpy as np
@@ -169,13 +171,94 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return cond.mean(dim=0, keepdim=True)
         return cond
 
-    def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True) -> dict:
+    @staticmethod
+    def _expand_cond(cond: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if cond.shape[0] == batch_size:
+            return cond
+        if cond.shape[0] == 1:
+            return cond.expand(batch_size, *cond.shape[1:])
+        raise ValueError(f"Conditioning batch size mismatch: {cond.shape[0]} vs {batch_size}")
+
+    @contextmanager
+    def inject_sampler_multi_image(
+        self,
+        sampler_name: str,
+        num_images: int,
+        num_steps: int,
+        mode: Literal["stochastic", "multidiffusion"] = "stochastic",
+    ):
+        sampler = getattr(self, sampler_name)
+        sampler._old_inference_model = sampler._inference_model
+        if mode == "stochastic":
+            cond_indices = [idx for _ in range(num_steps) for idx in range(num_images)]
+            cond_indices = np.random.permutation(cond_indices).tolist()
+
+            def _new_inference_model(_self, model, x_t, t, cond, **kwargs):
+                cond_idx = cond_indices.pop(0)
+                cond_i = cond[cond_idx:cond_idx + 1]
+                cond_i = self._expand_cond(cond_i, x_t.shape[0])
+                if 'neg_cond' in kwargs and kwargs['neg_cond'] is not None:
+                    kwargs['neg_cond'] = self._expand_cond(kwargs['neg_cond'], x_t.shape[0])
+                return _self._old_inference_model(model, x_t, t, cond=cond_i, **kwargs)
+
+        elif mode == "multidiffusion":
+            from .samplers.flow_euler import FlowEulerSampler
+
+            def _new_inference_model(_self, model, x_t, t, cond, **kwargs):
+                guidance_strength = kwargs.pop('guidance_strength', 1.0)
+                guidance_rescale = kwargs.pop('guidance_rescale', 0.0)
+                guidance_interval = kwargs.pop('guidance_interval', None)
+                neg_cond = kwargs.pop('neg_cond', None)
+
+                if guidance_interval is not None and not (guidance_interval[0] <= t <= guidance_interval[1]):
+                    guidance_strength = 1.0
+
+                preds_pos = []
+                for i in range(len(cond)):
+                    cond_i = self._expand_cond(cond[i:i + 1], x_t.shape[0])
+                    preds_pos.append(FlowEulerSampler._inference_model(_self, model, x_t, t, cond=cond_i, **kwargs))
+                pred_pos = sum(preds_pos) / len(preds_pos)
+
+                if neg_cond is None:
+                    return pred_pos
+
+                neg_cond = self._expand_cond(neg_cond, x_t.shape[0])
+
+                if guidance_strength == 1:
+                    return pred_pos
+                if guidance_strength == 0:
+                    return FlowEulerSampler._inference_model(_self, model, x_t, t, cond=neg_cond, **kwargs)
+
+                pred_neg = FlowEulerSampler._inference_model(_self, model, x_t, t, cond=neg_cond, **kwargs)
+                pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+
+                if guidance_rescale > 0:
+                    x_0_pos = _self._pred_to_xstart(x_t, t, pred_pos)
+                    x_0_cfg = _self._pred_to_xstart(x_t, t, pred)
+                    std_pos = x_0_pos.std(dim=list(range(1, x_0_pos.ndim)), keepdim=True)
+                    std_cfg = x_0_cfg.std(dim=list(range(1, x_0_cfg.ndim)), keepdim=True)
+                    x_0_rescaled = x_0_cfg * (std_pos / std_cfg)
+                    x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
+                    pred = _self._xstart_to_pred(x_t, t, x_0)
+
+                return pred
+        else:
+            raise ValueError(f"Invalid multi-image mode: {mode}")
+
+        sampler._inference_model = MethodType(_new_inference_model, sampler)
+        try:
+            yield
+        finally:
+            sampler._inference_model = sampler._old_inference_model
+            del sampler._old_inference_model
+
+    def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True, aggregate: bool = True) -> dict:
         """
         Get the conditioning information for the model.
 
         Args:
             image (Union[torch.Tensor, list[Image.Image]]): The image prompts. If multiple images
-                are provided, their conditioning is mean-pooled into a single embedding.
+                are provided, their conditioning is mean-pooled into a single embedding when aggregate=True.
 
         Returns:
             dict: The conditioning information
@@ -184,7 +267,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if self.low_vram:
             self.image_cond_model.to(self.device)
         cond = self.image_cond_model(image)
-        cond = self._aggregate_cond(cond)
+        if aggregate:
+            cond = self._aggregate_cond(cond)
         if self.low_vram:
             self.image_cond_model.cpu()
         if not include_neg_cond:
@@ -508,6 +592,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        multi_image_mode: Optional[Literal["stochastic", "multidiffusion"]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -548,13 +633,28 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             image = [self.preprocess_image(i) for i in image]
         elif preprocess_image and isinstance(image, Image.Image):
             image = self.preprocess_image(image)
+
+        if isinstance(image, list) and len(image) > 1:
+            return self.run_multi_image(
+                image,
+                num_samples=num_samples,
+                seed=seed,
+                sparse_structure_sampler_params=sparse_structure_sampler_params,
+                shape_slat_sampler_params=shape_slat_sampler_params,
+                tex_slat_sampler_params=tex_slat_sampler_params,
+                preprocess_image=False,
+                return_latent=return_latent,
+                pipeline_type=pipeline_type,
+                max_num_tokens=max_num_tokens,
+                mode=multi_image_mode or "stochastic",
+            )
         torch.manual_seed(seed)
         if isinstance(image, Image.Image):
             image_cond_input = [image]
         else:
             image_cond_input = image
-        cond_512 = self.get_cond(image_cond_input, 512)
-        cond_1024 = self.get_cond(image_cond_input, 1024) if pipeline_type != '512' else None
+        cond_512 = self.get_cond(image_cond_input, 512, aggregate=True)
+        cond_1024 = self.get_cond(image_cond_input, 1024, aggregate=True) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
@@ -604,6 +704,125 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
+        torch.cuda.empty_cache()
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if return_latent:
+            return out_mesh, (shape_slat, tex_slat, res)
+        else:
+            return out_mesh
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: list[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+        mode: Literal["stochastic", "multidiffusion"] = "stochastic",
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline with multi-image conditioning.
+
+        Args:
+            images (list[Image.Image]): The image prompts.
+            mode (str): Multi-image sampling mode. Options: 'stochastic', 'multidiffusion'.
+        """
+        # Check pipeline type
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '512':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
+        elif pipeline_type == '1024':
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        elif pipeline_type == '1024_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        elif pipeline_type == '1536_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+        else:
+            raise ValueError(f"Invalid pipeline type: {pipeline_type}")
+
+        if preprocess_image:
+            images = [self.preprocess_image(i) for i in images]
+
+        torch.manual_seed(seed)
+
+        cond_512 = self.get_cond(images, 512, aggregate=False)
+        cond_512['neg_cond'] = cond_512['neg_cond'][:1]
+        cond_1024 = self.get_cond(images, 1024, aggregate=False) if pipeline_type != '512' else None
+        if cond_1024 is not None:
+            cond_1024['neg_cond'] = cond_1024['neg_cond'][:1]
+
+        ss_steps = {**self.sparse_structure_sampler_params, **sparse_structure_sampler_params}.get('steps', 1)
+        shape_steps = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}.get('steps', 1)
+        tex_steps = {**self.tex_slat_sampler_params, **tex_slat_sampler_params}.get('steps', 1)
+        if pipeline_type in ['1024_cascade', '1536_cascade']:
+            shape_steps = shape_steps * 2
+
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+
+        with self.inject_sampler_multi_image('sparse_structure_sampler', len(images), ss_steps, mode), \
+             self.inject_sampler_multi_image('shape_slat_sampler', len(images), shape_steps, mode), \
+             self.inject_sampler_multi_image('tex_slat_sampler', len(images), tex_steps, mode):
+            coords = self.sample_sparse_structure(
+                cond_512, ss_res,
+                num_samples, sparse_structure_sampler_params
+            )
+            if pipeline_type == '512':
+                shape_slat = self.sample_shape_slat(
+                    cond_512, self.models['shape_slat_flow_model_512'],
+                    coords, shape_slat_sampler_params
+                )
+                tex_slat = self.sample_tex_slat(
+                    cond_512, self.models['tex_slat_flow_model_512'],
+                    shape_slat, tex_slat_sampler_params
+                )
+                res = 512
+            elif pipeline_type == '1024':
+                shape_slat = self.sample_shape_slat(
+                    cond_1024, self.models['shape_slat_flow_model_1024'],
+                    coords, shape_slat_sampler_params
+                )
+                tex_slat = self.sample_tex_slat(
+                    cond_1024, self.models['tex_slat_flow_model_1024'],
+                    shape_slat, tex_slat_sampler_params
+                )
+                res = 1024
+            elif pipeline_type == '1024_cascade':
+                shape_slat, res = self.sample_shape_slat_cascade(
+                    cond_512, cond_1024,
+                    self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                    512, 1024,
+                    coords, shape_slat_sampler_params,
+                    max_num_tokens
+                )
+                tex_slat = self.sample_tex_slat(
+                    cond_1024, self.models['tex_slat_flow_model_1024'],
+                    shape_slat, tex_slat_sampler_params
+                )
+            elif pipeline_type == '1536_cascade':
+                shape_slat, res = self.sample_shape_slat_cascade(
+                    cond_512, cond_1024,
+                    self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                    512, 1536,
+                    coords, shape_slat_sampler_params,
+                    max_num_tokens
+                )
+                tex_slat = self.sample_tex_slat(
+                    cond_1024, self.models['tex_slat_flow_model_1024'],
+                    shape_slat, tex_slat_sampler_params
+                )
+
         torch.cuda.empty_cache()
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
         if return_latent:
