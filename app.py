@@ -335,7 +335,7 @@ def show_next_extra_view(count: int, max_views: int) -> Tuple:
     """
     new_count = min(count + 1, max_views)
     updates = [
-        gr.Image.update(visible=(i < new_count))
+        gr.update(visible=(i < new_count))
         for i in range(max_views)
     ]
     return (new_count, *updates)
