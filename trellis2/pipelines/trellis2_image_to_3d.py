@@ -161,12 +161,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         output = Image.fromarray((output * 255).astype(np.uint8))
         return output
         
+    def _aggregate_cond(self, cond: torch.Tensor) -> torch.Tensor:
+        """
+        Aggregate multi-image conditioning into a single conditioning tensor.
+        """
+        if cond.ndim == 3 and cond.shape[0] > 1:
+            return cond.mean(dim=0, keepdim=True)
+        return cond
+
     def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True) -> dict:
         """
         Get the conditioning information for the model.
 
         Args:
-            image (Union[torch.Tensor, list[Image.Image]]): The image prompts.
+            image (Union[torch.Tensor, list[Image.Image]]): The image prompts. If multiple images
+                are provided, their conditioning is mean-pooled into a single embedding.
 
         Returns:
             dict: The conditioning information
@@ -175,6 +184,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if self.low_vram:
             self.image_cond_model.to(self.device)
         cond = self.image_cond_model(image)
+        cond = self._aggregate_cond(cond)
         if self.low_vram:
             self.image_cond_model.cpu()
         if not include_neg_cond:
@@ -488,7 +498,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     @torch.no_grad()
     def run(
         self,
-        image: Image.Image,
+        image: Union[Image.Image, list[Image.Image], torch.Tensor],
         num_samples: int = 1,
         seed: int = 42,
         sparse_structure_sampler_params: dict = {},
@@ -503,7 +513,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Run the pipeline.
 
         Args:
-            image (Image.Image): The image prompt.
+            image (Union[Image.Image, list[Image.Image], torch.Tensor]): The image prompt(s).
+                If a list is provided, all images are encoded and mean-pooled into one conditioning.
             num_samples (int): The number of samples to generate.
             seed (int): The random seed.
             sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
@@ -533,11 +544,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
-        if preprocess_image:
+        if preprocess_image and isinstance(image, list):
+            image = [self.preprocess_image(i) for i in image]
+        elif preprocess_image and isinstance(image, Image.Image):
             image = self.preprocess_image(image)
         torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        if isinstance(image, Image.Image):
+            image_cond_input = [image]
+        else:
+            image_cond_input = image
+        cond_512 = self.get_cond(image_cond_input, 512)
+        cond_1024 = self.get_cond(image_cond_input, 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,

@@ -322,6 +322,21 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return processed_image
 
 
+def load_extra_views(files: Optional[Union[str, List[str]]]) -> List[Image.Image]:
+    """
+    Load extra view images from file paths.
+    """
+    if not files:
+        return []
+    if isinstance(files, str):
+        files = [files]
+    images = []
+    for path in files:
+        if path:
+            images.append(Image.open(path))
+    return images
+
+
 def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
     shape_slat, tex_slat, res = latents
     return {
@@ -350,6 +365,7 @@ def get_seed(randomize_seed: bool, seed: int) -> int:
 
 def image_to_3d(
     image: Image.Image,
+    extra_views: Optional[List[str]],
     seed: int,
     resolution: str,
     ss_guidance_strength: float,
@@ -368,8 +384,14 @@ def image_to_3d(
     progress=gr.Progress(track_tqdm=True),
 ) -> str:
     # --- Sampling ---
+    extra_images = load_extra_views(extra_views)
+    if extra_images:
+        extra_images = [pipeline.preprocess_image(img) for img in extra_images]
+        image_input: Union[Image.Image, List[Image.Image]] = [image, *extra_images]
+    else:
+        image_input = image
     outputs, latents = pipeline.run(
-        image,
+        image_input,
         seed=seed,
         preprocess_image=False,
         sparse_structure_sampler_params={
@@ -524,6 +546,12 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     with gr.Row():
         with gr.Column(scale=1, min_width=360):
             image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
+            extra_views = gr.File(
+                label="Extra Views (optional)",
+                file_types=["image"],
+                file_count="multiple",
+                type="filepath",
+            )
             
             resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
@@ -597,7 +625,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     ).then(
         image_to_3d,
         inputs=[
-            image_prompt, seed, resolution,
+            image_prompt, extra_views, seed, resolution,
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
             tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
