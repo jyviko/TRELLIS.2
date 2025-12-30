@@ -322,19 +322,23 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return processed_image
 
 
-def load_extra_views(files: Optional[Union[str, List[str]]]) -> List[Image.Image]:
+def collect_extra_views(*images: Optional[Image.Image]) -> List[Image.Image]:
     """
-    Load extra view images from file paths.
+    Collect non-empty extra view images.
     """
-    if not files:
-        return []
-    if isinstance(files, str):
-        files = [files]
-    images = []
-    for path in files:
-        if path:
-            images.append(Image.open(path))
-    return images
+    return [img for img in images if img is not None]
+
+
+def show_next_extra_view(count: int, max_views: int) -> Tuple:
+    """
+    Increase visible extra-view slots by one.
+    """
+    new_count = min(count + 1, max_views)
+    updates = [
+        gr.Image.update(visible=(i < new_count))
+        for i in range(max_views)
+    ]
+    return (new_count, *updates)
 
 
 def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
@@ -365,7 +369,14 @@ def get_seed(randomize_seed: bool, seed: int) -> int:
 
 def image_to_3d(
     image: Image.Image,
-    extra_views: Optional[List[str]],
+    extra_view_1: Optional[Image.Image],
+    extra_view_2: Optional[Image.Image],
+    extra_view_3: Optional[Image.Image],
+    extra_view_4: Optional[Image.Image],
+    extra_view_5: Optional[Image.Image],
+    extra_view_6: Optional[Image.Image],
+    extra_view_7: Optional[Image.Image],
+    extra_view_8: Optional[Image.Image],
     seed: int,
     resolution: str,
     ss_guidance_strength: float,
@@ -384,9 +395,11 @@ def image_to_3d(
     progress=gr.Progress(track_tqdm=True),
 ) -> str:
     # --- Sampling ---
-    extra_images = load_extra_views(extra_views)
+    extra_images = collect_extra_views(
+        extra_view_1, extra_view_2, extra_view_3, extra_view_4,
+        extra_view_5, extra_view_6, extra_view_7, extra_view_8,
+    )
     if extra_images:
-        extra_images = [pipeline.preprocess_image(img) for img in extra_images]
         image_input: Union[Image.Image, List[Image.Image]] = [image, *extra_images]
     else:
         image_input = image
@@ -546,12 +559,20 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     with gr.Row():
         with gr.Column(scale=1, min_width=360):
             image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
-            extra_views = gr.File(
-                label="Extra Views (optional)",
-                file_types=["image"],
-                file_count="multiple",
-                type="filepath",
-            )
+            add_view_btn = gr.Button("Add Extra View")
+            extra_view_count = gr.State(0)
+            extra_views = []
+            for i in range(8):
+                extra_views.append(
+                    gr.Image(
+                        label=f"Extra View {i + 1} (optional)",
+                        format="png",
+                        image_mode="RGBA",
+                        type="pil",
+                        height=200,
+                        visible=False,
+                    )
+                )
             
             resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
@@ -615,6 +636,18 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         inputs=[image_prompt],
         outputs=[image_prompt],
     )
+    for extra_view in extra_views:
+        extra_view.upload(
+            preprocess_image,
+            inputs=[extra_view],
+            outputs=[extra_view],
+        )
+
+    add_view_btn.click(
+        lambda count: show_next_extra_view(count, len(extra_views)),
+        inputs=[extra_view_count],
+        outputs=[extra_view_count, *extra_views],
+    )
 
     generate_btn.click(
         get_seed,
@@ -625,7 +658,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     ).then(
         image_to_3d,
         inputs=[
-            image_prompt, extra_views, seed, resolution,
+            image_prompt, *extra_views, seed, resolution,
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
             tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
