@@ -414,12 +414,18 @@ class Sam3Segmenter:
         if masks is None:
             raise RuntimeError("SAM3 did not return masks.")
         if isinstance(masks, torch.Tensor):
+            if masks.numel() == 0:
+                h, w = self.predictor.get("image_shape", (0, 0))
+                return np.zeros((h, w), dtype=bool)
             if masks.ndim == 3:
                 mask = masks.any(dim=0).cpu().numpy()
             else:
                 mask = masks[0].cpu().numpy()
         else:
             masks = np.asarray(masks)
+            if masks.size == 0:
+                h, w = self.predictor.get("image_shape", (0, 0))
+                return np.zeros((h, w), dtype=bool)
             if masks.ndim == 3:
                 mask = masks.any(axis=0)
             else:
@@ -433,6 +439,7 @@ class Sam3Segmenter:
         pil_image = Image.fromarray(image)
         state = processor.set_image(pil_image)
         self.predictor["state"] = state
+        self.predictor["image_shape"] = image.shape[:2]
         return [self._predict_mask(prompt) for prompt in prompts]
 
 
