@@ -80,6 +80,7 @@ class MeshRenderer:
                 depth (torch.Tensor): [H, W] rendered depth image
                 normal (torch.Tensor): [3, H, W] rendered normal image
                 mask (torch.Tensor): [H, W] rendered mask image
+                face_id (torch.Tensor): [H, W] triangle id map (0 = background)
         """
         if 'dr' not in globals():
             import nvdiffrast.torch as dr
@@ -154,6 +155,8 @@ class MeshRenderer:
                     img = dr.interpolate(face_normal.unsqueeze(0), rast, torch.arange(face_normal.shape[0], dtype=torch.int, device=self.device).unsqueeze(1).repeat(1, 3).contiguous())[0]
                     if antialias: img = dr.antialias(img, rast, vertices_clip, faces)
                     img = (img + 1) / 2
+                elif type == "face_id":
+                    img = rast[..., -1:].clone()
                 elif type == "coord":
                     img = dr.interpolate(vertices, rast, faces)[0]
                     if antialias: img = dr.antialias(img, rast, vertices_clip, faces)
@@ -286,6 +289,8 @@ class MeshRenderer:
                         face_normal_chunk = face_normal[i:i+chunk_size]
                         img = dr.interpolate(face_normal_chunk.unsqueeze(0), rast, torch.arange(face_normal_chunk.shape[0], dtype=torch.int, device=self.device).unsqueeze(1).repeat(1, 3).contiguous())[0]
                         img = (img + 1) / 2
+                    elif type == "face_id":
+                        img = rast[..., -1:].clone()
                     elif type == "coord":
                         img = dr.interpolate(vertices, rast, faces_chunk)[0]
                     elif type == "attr":
@@ -400,10 +405,16 @@ class MeshRenderer:
         for type in return_types:
             img = out_dict[type]
             if ssaa > 1:
-                img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='bilinear', align_corners=False, antialias=True)
-                img = img.squeeze()
+                if type == "face_id":
+                    img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='nearest')
+                    img = img.squeeze()
+                else:
+                    img = F.interpolate(img.permute(0, 3, 1, 2), (resolution, resolution), mode='bilinear', align_corners=False, antialias=True)
+                    img = img.squeeze()
             else:
                 img = img.permute(0, 3, 1, 2).squeeze()
+            if type == "face_id":
+                img = img.round().to(torch.int64)
             out_dict[type] = img
 
         if isinstance(mesh, (MeshWithVoxel, MeshWithPbrMaterial)) and 'attr' in return_types:

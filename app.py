@@ -5,6 +5,8 @@ os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from datetime import datetime
 import shutil
+import zipfile
+import inspect
 import cv2
 from typing import *
 import torch
@@ -12,15 +14,31 @@ import numpy as np
 from PIL import Image
 import base64
 import io
+import trimesh
 from trellis2.modules.sparse import SparseTensor
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
-from trellis2.renderers import EnvMap
+from trellis2.renderers import EnvMap, MeshRenderer
+from trellis2.representations import Mesh
 from trellis2.utils import render_utils
+from trellis2.utils.random_utils import sphere_hammersley_sequence
 import o_voxel
 
 
 MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
+PREVIEW_DECIMATION_TARGET = 200000
+PREVIEW_TEXTURE_SIZE = 1024
+DEFAULT_PART_PROMPTS = """head
+ears
+goggles
+scarf
+body
+arms
+gloves
+belt
+bag
+tail
+base"""
 MODES = [
     {"name": "Normal", "icon": "assets/app/normal.png", "render_key": "normal"},
     {"name": "Clay render", "icon": "assets/app/clay.png", "render_key": "clay"},
@@ -341,6 +359,198 @@ def show_next_extra_view(count: int, max_views: int) -> Tuple:
     return (new_count, *updates)
 
 
+def parse_part_prompts(text: str) -> List[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+class Sam3Segmenter:
+    def __init__(self, checkpoint: str, device: str = "cuda"):
+        if not checkpoint:
+            raise ValueError("SAM3 checkpoint path is required.")
+        self.checkpoint = checkpoint
+        self.device = device
+        self.predictor = self._build_predictor()
+        self._mode = "processor" if "processor" in self.predictor else "predictor"
+
+    def _build_predictor(self):
+        try:
+            try:
+                from sam3.model_builder import build_sam3_image_model  # type: ignore
+            except Exception:  # pragma: no cover - package layout varies
+                from sam3 import build_sam3_image_model  # type: ignore
+            try:
+                from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore
+            except Exception:  # pragma: no cover - package layout varies
+                try:
+                    from sam3.sam3_image_processor import Sam3Processor  # type: ignore
+                except Exception:
+                    from sam3 import Sam3Processor  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on external package
+            raise ImportError(
+                "SAM3 is not installed or imports failed. Install facebookresearch/sam3 and set SAM3_CHECKPOINT."
+            ) from exc
+        build_sig = inspect.signature(build_sam3_image_model)
+        if "checkpoint_path" in build_sig.parameters:
+            model = build_sam3_image_model(checkpoint_path=self.checkpoint)
+        elif "checkpoint" in build_sig.parameters:
+            model = build_sam3_image_model(checkpoint=self.checkpoint)
+        else:
+            model = build_sam3_image_model()
+        model = model.to(self.device)
+        processor = Sam3Processor(model)
+        return {"processor": processor}
+
+    def _predict_mask(self, prompt: str) -> np.ndarray:
+        if self._mode != "processor":
+            raise RuntimeError("SAM3 processor not initialized.")
+        processor = self.predictor["processor"]
+        inference_state = self.predictor.get("state")
+        output = processor.set_text_prompt(state=inference_state, prompt=prompt)
+        masks = None
+        if isinstance(output, dict):
+            masks = output.get("masks")
+        elif isinstance(output, (tuple, list)) and output:
+            masks = output[0]
+        if masks is None:
+            raise RuntimeError("SAM3 did not return masks.")
+        if isinstance(masks, torch.Tensor):
+            if masks.ndim == 3:
+                mask = masks.any(dim=0).cpu().numpy()
+            else:
+                mask = masks[0].cpu().numpy()
+        else:
+            masks = np.asarray(masks)
+            if masks.ndim == 3:
+                mask = masks.any(axis=0)
+            else:
+                mask = masks[0]
+        return mask.astype(bool)
+
+    def segment(self, image: np.ndarray, prompts: List[str]) -> List[np.ndarray]:
+        if self._mode != "processor":
+            raise RuntimeError("SAM3 processor not initialized.")
+        processor = self.predictor["processor"]
+        pil_image = Image.fromarray(image)
+        state = processor.set_image(pil_image)
+        self.predictor["state"] = state
+        return [self._predict_mask(prompt) for prompt in prompts]
+
+
+_SAM3_SEGMENTER: Optional[Sam3Segmenter] = None
+
+
+def get_sam3_segmenter(checkpoint: str, device: str) -> Sam3Segmenter:
+    global _SAM3_SEGMENTER
+    if _SAM3_SEGMENTER is None or _SAM3_SEGMENTER.checkpoint != checkpoint or _SAM3_SEGMENTER.device != device:
+        _SAM3_SEGMENTER = Sam3Segmenter(checkpoint=checkpoint, device=device)
+    return _SAM3_SEGMENTER
+
+
+def render_segmentation_views(
+    mesh: Mesh,
+    num_views: int,
+    resolution: int,
+    r: float = 2.0,
+    fov: float = 40.0,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    cams = [sphere_hammersley_sequence(i, num_views) for i in range(num_views)]
+    yaws = [cam[0] for cam in cams]
+    pitchs = [cam[1] for cam in cams]
+    extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, r, fov)
+
+    color_renderer = render_utils.get_renderer(mesh, resolution=resolution, ssaa=1, near=1, far=100)
+    face_renderer = MeshRenderer()
+    face_renderer.rendering_options.resolution = resolution
+    face_renderer.rendering_options.near = 1
+    face_renderer.rendering_options.far = 100
+    face_renderer.rendering_options.ssaa = 1
+    face_mesh = Mesh(mesh.vertices, mesh.faces)
+
+    images: List[np.ndarray] = []
+    face_ids: List[np.ndarray] = []
+    for extr, intr in zip(extrinsics, intrinsics):
+        color_out = color_renderer.render(mesh, extr, intr, envmap=envmap, use_envmap_bg=True)
+        shaded = color_out.get("shaded") or color_out.get("base_color")
+        if shaded is None:
+            raise RuntimeError("Renderer did not return shaded/base_color output.")
+        color = np.clip(shaded.detach().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8)
+        face_out = face_renderer.render(face_mesh, extr, intr, return_types=["face_id"])
+        face_map = face_out["face_id"].detach().cpu().numpy()
+        images.append(color)
+        face_ids.append(face_map)
+    return images, face_ids
+
+
+def aggregate_face_votes(face_ids: List[np.ndarray], masks_per_view: List[List[np.ndarray]], num_faces: int) -> np.ndarray:
+    counts = np.zeros((len(masks_per_view[0]), num_faces), dtype=np.int32)
+    for view_idx, face_map in enumerate(face_ids):
+        for prompt_idx, mask in enumerate(masks_per_view[view_idx]):
+            ids = face_map[mask]
+            ids = ids[ids > 0] - 1
+            if ids.size == 0:
+                continue
+            counts[prompt_idx] += np.bincount(ids.astype(np.int64), minlength=num_faces)
+    return counts
+
+
+def extract_submesh(vertices: torch.Tensor, faces: torch.Tensor, face_mask: np.ndarray) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not face_mask.any():
+        return None
+    face_mask_t = torch.from_numpy(face_mask).to(faces.device)
+    faces_sel = faces[face_mask_t]
+    if faces_sel.numel() == 0:
+        return None
+    unique, inverse = torch.unique(faces_sel.reshape(-1), return_inverse=True)
+    verts_sel = vertices[unique]
+    faces_remap = inverse.reshape(-1, 3)
+    return verts_sel, faces_remap
+
+
+def resurface_mesh(vertices: torch.Tensor, faces: torch.Tensor, grid_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    aabb = torch.stack([vertices.min(dim=0).values, vertices.max(dim=0).values], dim=0).cpu()
+    coords, dual_vertices, intersected_flag = o_voxel.convert.mesh_to_flexible_dual_grid(
+        vertices.cpu(), faces.cpu(), grid_size=grid_size, aabb=aabb
+    )
+    new_vertices, new_faces = o_voxel.convert.flexible_dual_grid_to_mesh(
+        coords, dual_vertices, intersected_flag, None, aabb, grid_size=grid_size
+    )
+    return new_vertices.cpu(), new_faces.cpu()
+
+
+def export_mesh(path: str, vertices: torch.Tensor, faces: torch.Tensor) -> None:
+    mesh = trimesh.Trimesh(vertices.cpu().numpy(), faces.cpu().numpy(), process=False)
+    mesh.export(path)
+
+
+def build_preview_glb(
+    mesh: Mesh,
+    user_dir: str,
+    decimation_target: int = PREVIEW_DECIMATION_TARGET,
+    texture_size: int = PREVIEW_TEXTURE_SIZE,
+) -> str:
+    glb = o_voxel.postprocess.to_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=pipeline.pbr_attr_layout,
+        grid_size=mesh.voxel_shape,
+        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        remesh=True,
+        remesh_band=1,
+        remesh_project=0,
+        use_tqdm=False,
+    )
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
+    os.makedirs(user_dir, exist_ok=True)
+    glb_path = os.path.join(user_dir, f'preview_{timestamp}.glb')
+    glb.export(glb_path, extension_webp=True)
+    return glb_path
+
+
 def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
     shape_slat, tex_slat, res = latents
     return {
@@ -436,74 +646,101 @@ def image_to_3d(
     )
     mesh = outputs[0]
     mesh.simplify(16777216) # nvdiffrast limit
-    images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
     state = pack_state(latents)
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    preview_glb = build_preview_glb(mesh, user_dir)
     torch.cuda.empty_cache()
-    
-    # --- HTML Construction ---
-    # The Stack of 48 Images
-    images_html = ""
-    for m_idx, mode in enumerate(MODES):
-        for s_idx in range(STEPS):
-            # ID Naming Convention: view-m{mode}-s{step}
-            unique_id = f"view-m{m_idx}-s{s_idx}"
-            
-            # Logic: Only Mode 0, Step 0 is visible initially
-            is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
-            vis_class = "visible" if is_visible else ""
-            
-            # Image Source
-            img_base64 = image_to_base64(Image.fromarray(images[mode['render_key']][s_idx]))
-            
-            # Render the Tag
-            images_html += f"""
-                <img id="{unique_id}" 
-                     class="previewer-main-image {vis_class}" 
-                     src="{img_base64}" 
-                     loading="eager">
-            """
-    
-    # Button Row HTML
-    btns_html = ""
-    for idx, mode in enumerate(MODES):        
-        active_class = "active" if idx == DEFAULT_MODE else ""
-        # Note: onclick calls the JS function defined in Head
-        btns_html += f"""
-            <img src="{mode['icon_base64']}" 
-                 class="mode-btn {active_class}" 
-                 onclick="selectMode({idx})"
-                 title="{mode['name']}">
-        """
-    
-    # Assemble the full component
-    full_html = f"""
-    <div class="previewer-container">
-        <div class="tips-wrapper">
-            <div class="tips-icon">💡Tips</div>
-            <div class="tips-text">
-                <p>● <b>Render Mode</b> - Click on the circular buttons to switch between different render modes.</p>
-                <p>● <b>View Angle</b> - Drag the slider to change the view angle.</p>
-            </div>
-        </div>
-        
-        <!-- Row 1: Viewport containing 48 static <img> tags -->
-        <div class="display-row">
-            {images_html}
-        </div>
-        
-        <!-- Row 2 -->
-        <div class="mode-row" id="btn-group">
-            {btns_html}
-        </div>
+    return state, preview_glb
 
-        <!-- Row 3: Slider -->
-        <div class="slider-row">
-            <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
-        </div>
-    </div>
-    """
-    
-    return state, full_html
+
+def segment_and_split(
+    state: dict,
+    part_prompts_text: str,
+    sam3_checkpoint: str,
+    sam3_device: str,
+    part_view_count: int,
+    part_view_resolution: int,
+    part_min_votes: int,
+    resurface_parts: bool,
+    part_grid_size: int,
+    part_export_format: str,
+    part_bake_textures: bool,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> Tuple[List[str], str, str]:
+    prompts = parse_part_prompts(part_prompts_text)
+    if not prompts:
+        return [], "", "No prompts provided."
+    if part_export_format not in ("glb", "obj"):
+        return [], "", f"Unsupported export format: {part_export_format}"
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    os.makedirs(user_dir, exist_ok=True)
+
+    progress(0, desc="Decoding mesh")
+    shape_slat, tex_slat, res = unpack_state(state)
+    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+    mesh.simplify(16777216)
+
+    progress(0.1, desc="Rendering segmentation views")
+    images, face_ids = render_segmentation_views(mesh, part_view_count, part_view_resolution)
+
+    progress(0.3, desc="Running SAM3")
+    segmenter = get_sam3_segmenter(sam3_checkpoint, sam3_device)
+    masks_per_view = [segmenter.segment(img, prompts) for img in images]
+
+    progress(0.5, desc="Aggregating face votes")
+    counts = aggregate_face_votes(face_ids, masks_per_view, mesh.faces.shape[0])
+    best_idx = counts.argmax(axis=0)
+    best_votes = counts.max(axis=0)
+    face_labels = np.where(best_votes >= part_min_votes, best_idx, -1)
+
+    progress(0.7, desc="Exporting parts")
+    part_files: List[str] = []
+    for idx, prompt in enumerate(prompts):
+        face_mask = face_labels == idx
+        sub = extract_submesh(mesh.vertices, mesh.faces, face_mask)
+        if sub is None:
+            continue
+        part_vertices, part_faces = sub
+        if resurface_parts:
+            try:
+                part_vertices, part_faces = resurface_mesh(part_vertices, part_faces, part_grid_size)
+            except Exception:
+                pass
+        safe_name = prompt.replace(" ", "_").replace("/", "_")
+        filename = f"part_{idx:02d}_{safe_name}.{part_export_format}"
+        out_path = os.path.join(user_dir, filename)
+        if part_bake_textures and part_export_format == "glb":
+            glb = o_voxel.postprocess.to_glb(
+                vertices=part_vertices,
+                faces=part_faces,
+                attr_volume=mesh.attrs,
+                coords=mesh.coords,
+                attr_layout=pipeline.pbr_attr_layout,
+                grid_size=res,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target=PREVIEW_DECIMATION_TARGET,
+                texture_size=PREVIEW_TEXTURE_SIZE,
+                remesh=True,
+                remesh_band=1,
+                remesh_project=0,
+                use_tqdm=False,
+            )
+            glb.export(out_path, extension_webp=True)
+        else:
+            export_mesh(out_path, part_vertices, part_faces)
+        part_files.append(out_path)
+
+    if not part_files:
+        return [], "", "No parts were generated (increase views or lower vote threshold)."
+
+    zip_path = os.path.join(user_dir, "parts.zip")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in part_files:
+            zf.write(path, arcname=os.path.basename(path))
+
+    torch.cuda.empty_cache()
+    return part_files, zip_path, f"Exported {len(part_files)} parts."
 
 
 def extract_glb(
@@ -561,7 +798,6 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
     with gr.Row():
         with gr.Column(scale=1, min_width=360):
             image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
-            add_view_btn = gr.Button("Add Extra View")
             extra_view_count = gr.State(0)
             extra_views = []
             for i in range(8):
@@ -575,6 +811,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                         visible=False,
                     )
                 )
+            add_view_btn = gr.Button("Add Extra View")
             
             resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
@@ -608,15 +845,45 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                     tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
                     tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
                     tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)                
+            
+            with gr.Accordion(label="Part Segmentation (SAM3)", open=False):
+                part_prompts = gr.Textbox(
+                    label="Part Prompts (one per line)",
+                    lines=8,
+                    value=DEFAULT_PART_PROMPTS,
+                )
+                sam3_checkpoint = gr.Textbox(
+                    label="SAM3 checkpoint path",
+                    value=os.getenv("SAM3_CHECKPOINT", ""),
+                )
+                sam3_device = gr.Radio(["cuda", "cpu"], label="SAM3 device", value="cuda")
+                part_view_count = gr.Slider(3, 16, label="Segmentation Views", value=8, step=1)
+                part_view_resolution = gr.Slider(128, 768, label="View Resolution", value=384, step=64)
+                part_min_votes = gr.Slider(1, 8, label="Min View Votes per Face", value=2, step=1)
+                resurface_parts = gr.Checkbox(label="Volumetric Resurface (watertight)", value=True)
+                part_grid_size = gr.Slider(64, 384, label="Resurface Grid Size", value=192, step=32)
+                part_export_format = gr.Dropdown(["glb", "obj"], label="Part Export Format", value="glb")
+                part_bake_textures = gr.Checkbox(label="Bake textures for parts (slow)", value=False)
+                split_btn = gr.Button("Segment & Split")
 
         with gr.Column(scale=10):
             with gr.Walkthrough(selected=0) as walkthrough:
                 with gr.Step("Preview", id=0):
-                    preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
+                    preview_output = gr.Model3D(
+                        label="3D Asset Preview",
+                        height=724,
+                        show_label=True,
+                        display_mode="solid",
+                        clear_color=(0.25, 0.25, 0.25, 1.0),
+                    )
                     extract_btn = gr.Button("Extract GLB")
                 with gr.Step("Extract", id=1):
                     glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                     download_btn = gr.DownloadButton(label="Download GLB")
+            with gr.Accordion("Parts Output", open=False):
+                parts_files = gr.Files(label="Part Meshes")
+                parts_zip = gr.DownloadButton(label="Download Parts ZIP")
+                parts_status = gr.Markdown()
                     
         with gr.Column(scale=1, min_width=172):
             examples = gr.Examples(
@@ -680,6 +947,24 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         inputs=[output_buf, decimation_target, texture_size],
         outputs=[glb_output, download_btn],
     )
+
+    split_btn.click(
+        segment_and_split,
+        inputs=[
+            output_buf,
+            part_prompts,
+            sam3_checkpoint,
+            sam3_device,
+            part_view_count,
+            part_view_resolution,
+            part_min_votes,
+            resurface_parts,
+            part_grid_size,
+            part_export_format,
+            part_bake_textures,
+        ],
+        outputs=[parts_files, parts_zip, parts_status],
+    )
         
 
 # Launch the Gradio app
@@ -710,4 +995,4 @@ if __name__ == "__main__":
         )),
     }
     
-    demo.launch(css=css, head=head)
+    demo.launch(css=css)
