@@ -430,6 +430,11 @@ class Sam3Segmenter:
                 mask = masks.any(axis=0)
             else:
                 mask = masks[0]
+        if mask.ndim > 2:
+            mask = np.squeeze(mask)
+        if mask.ndim != 2:
+            h, w = self.predictor.get("image_shape", (0, 0))
+            return np.zeros((h, w), dtype=bool)
         return mask.astype(bool)
 
     def segment(self, image: np.ndarray, prompts: List[str]) -> List[np.ndarray]:
@@ -492,6 +497,11 @@ def aggregate_face_votes(face_ids: List[np.ndarray], masks_per_view: List[List[n
     counts = np.zeros((len(masks_per_view[0]), num_faces), dtype=np.int32)
     for view_idx, face_map in enumerate(face_ids):
         for prompt_idx, mask in enumerate(masks_per_view[view_idx]):
+            mask = np.asarray(mask)
+            if mask.ndim > 2:
+                mask = np.squeeze(mask)
+            if mask.ndim != 2:
+                continue
             ids = face_map[mask]
             ids = ids[ids > 0] - 1
             if ids.size == 0:
@@ -680,6 +690,8 @@ def segment_and_split(
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[List[str], str, str]:
+    if not sam3_checkpoint:
+        return [], "", "SAM3 checkpoint path is required."
     prompts = parse_part_prompts(part_prompts_text)
     if not prompts:
         return [], "", "No prompts provided."
