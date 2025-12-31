@@ -528,13 +528,18 @@ def build_preview_glb(
     decimation_target: int = PREVIEW_DECIMATION_TARGET,
     texture_size: int = PREVIEW_TEXTURE_SIZE,
 ) -> str:
+    grid_size = mesh.voxel_shape
+    if isinstance(grid_size, torch.Size) and len(grid_size) > 3:
+        grid_size = torch.Size(grid_size[-3:])
+    if isinstance(grid_size, (list, tuple)):
+        grid_size = torch.Size(grid_size[-3:])
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
         attr_volume=mesh.attrs,
         coords=mesh.coords,
         attr_layout=pipeline.pbr_attr_layout,
-        grid_size=mesh.voxel_shape,
+        grid_size=grid_size,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         texture_size=texture_size,
